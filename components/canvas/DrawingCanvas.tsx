@@ -8,8 +8,9 @@ import {
     Rect,
     Skia
 } from '@shopify/react-native-skia';
+import { Copy, Trash2, X } from 'lucide-react-native';
 import React, { useState } from 'react';
-import { StyleSheet, View, useColorScheme } from 'react-native';
+import { Alert, StyleSheet, Text, TouchableOpacity, View, useColorScheme } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 
 const isPointInPolygon = (point: Point, polygon: Point[]) => {
@@ -62,17 +63,17 @@ export const DrawingCanvas = () => {
         canvasWidth,
         canvasHeight,
         fillCanvas,
+        deleteSelectedPaths,
+        duplicateSelectedPaths,
     } = useDrawingStore();
 
     const [currentPoints, setCurrentPoints] = useState<Point[]>([]);
     const activePointsRef = React.useRef<Point[]>([]);
     const lastPosRef = React.useRef<{ x: number, y: number } | null>(null);
-    const baseFocalRef = React.useRef<{ x: number, y: number }>({ x: 0, y: 0 });
 
     // Refs for zoom/pan to avoid state-stale closures in worklets if needed, 
     // but runOnJS(true) is used here for simplicity.
     const baseScaleRef = React.useRef(scale);
-    const baseOffsetRef = React.useRef(offset);
 
     const getLiveCanvasPos = (x: number, y: number) => {
         const state = useDrawingStore.getState();
@@ -98,48 +99,45 @@ export const DrawingCanvas = () => {
         })
         .runOnJS(true);
 
+    const zoomFocalRef = React.useRef<{ x: number, y: number }>({ x: 0, y: 0 });
+    const isPinchingRef = React.useRef(false);
+    const lastPinchEndTimeRef = React.useRef(0);
+
     const zoomGesture = Gesture.Pinch()
         .onStart((event) => {
+            if (event.numberOfPointers < 2) return;
+            isPinchingRef.current = true;
             const state = useDrawingStore.getState();
             baseScaleRef.current = state.scale;
-            baseOffsetRef.current = state.offset;
-
-            // Capture the initial focal point in canvas space
-            baseFocalRef.current = {
+            // Capture the canvas point under the focal point at the start of the pinch
+            zoomFocalRef.current = {
                 x: (event.focalX - state.offset.x) / state.scale,
                 y: (event.focalY - state.offset.y) / state.scale,
             };
         })
         .onUpdate((event) => {
+            // CRITICAL: When one finger is lifted, event.numberOfPointers drops to 1, 
+            // and focalX/Y jumps to the remaining finger. We MUST ignore these final updates
+            // to prevent the "snap" or "jump" of the canvas.
+            if (event.numberOfPointers < 2 || !isPinchingRef.current) return;
+
             const newScale = baseScaleRef.current * event.scale;
             const clampedScale = Math.min(Math.max(newScale, 0.1), 10);
 
-            // Current focal point (fingers might have moved)
-            const focalX = event.focalX;
-            const focalY = event.focalY;
-
-            // To pin baseFocalRef.current to the current screen focal point:
-            // focalX = baseFocal.x * clampedScale + newOffsetX
-            const newOffsetX = focalX - baseFocalRef.current.x * clampedScale;
-            const newOffsetY = focalY - baseFocalRef.current.y * clampedScale;
+            // To keep zoomFocalRef.current at the current focalX/Y:
+            // focalX = zoomFocal.x * clampedScale + newOffsetX
+            // => newOffsetX = focalX - zoomFocal.x * clampedScale
+            const newOffsetX = event.focalX - zoomFocalRef.current.x * clampedScale;
+            const newOffsetY = event.focalY - zoomFocalRef.current.y * clampedScale;
 
             setCanvasTransform(clampedScale, { x: newOffsetX, y: newOffsetY });
         })
-        .runOnJS(true);
-
-    const panCanvasGesture = Gesture.Pan()
-        .minPointers(2)
-        .maxPointers(2)
-        .onStart(() => {
-            const state = useDrawingStore.getState();
-            baseOffsetRef.current = state.offset;
+        .onEnd(() => {
+            isPinchingRef.current = false;
+            lastPinchEndTimeRef.current = Date.now();
         })
-        .onUpdate((event) => {
-            const newOffset = {
-                x: baseOffsetRef.current.x + event.translationX,
-                y: baseOffsetRef.current.y + event.translationY,
-            };
-            setCanvasTransform(undefined, newOffset);
+        .onFinalize(() => {
+            isPinchingRef.current = false;
         })
         .runOnJS(true);
 
@@ -150,6 +148,20 @@ export const DrawingCanvas = () => {
         .minDistance(0)
         .onStart((event) => {
             const state = useDrawingStore.getState();
+
+            // Check for locked layer
+            const currentFrame = state.frames[state.currentFrameIndex];
+            const currentLayer = currentFrame.layers.find(l => l.id === state.currentLayerId);
+
+            if (currentLayer?.locked) {
+                Alert.alert("Layer Locked", "This layer is locked. Unlock it to edit.");
+                return;
+            }
+
+            // Small cooldown (100ms) after pinch to prevent accidental drawing/moving 
+            // when one finger stays down a bit longer.
+            if (isPinchingRef.current || (Date.now() - lastPinchEndTimeRef.current < 100)) return;
+
             const pos = getLiveCanvasPos(event.x, event.y);
             if (state.selectedTool === 'brush' || state.selectedTool === 'eraser' || state.selectedTool === 'lasso') {
                 const newPoint = { x: pos.x, y: pos.y, pressure: 1 };
@@ -169,6 +181,9 @@ export const DrawingCanvas = () => {
             const state = useDrawingStore.getState();
             const pos = getLiveCanvasPos(event.x, event.y);
             if (state.selectedTool === 'brush' || state.selectedTool === 'eraser' || state.selectedTool === 'lasso') {
+                // If start was blocked (e.g. locked layer), activePointsRef will be empty. Do nothing.
+                if (activePointsRef.current.length === 0) return;
+
                 const newPoint = { x: pos.x, y: pos.y, pressure: 1 };
                 activePointsRef.current.push(newPoint);
                 setCurrentPoints([...activePointsRef.current]);
@@ -223,7 +238,7 @@ export const DrawingCanvas = () => {
 
     const composedGesture = Gesture.Simultaneous(
         Gesture.Exclusive(redoGesture, undoGesture),
-        Gesture.Simultaneous(zoomGesture, panCanvasGesture),
+        zoomGesture,
         panGesture
     );
 
@@ -264,8 +279,17 @@ export const DrawingCanvas = () => {
     const currentFrame = frames[currentFrameIndex];
     const prevFrame = currentFrameIndex > 0 ? frames[currentFrameIndex - 1] : null;
 
+    // Safety check: if no current frame exists, don't render
+    if (!currentFrame) {
+        return (
+            <View style={[styles.container, { backgroundColor: theme.canvasBackground, justifyContent: 'center', alignItems: 'center' }]}>
+                <Text style={{ color: theme.text }}>No frame available</Text>
+            </View>
+        );
+    }
+
     const onionSkin = React.useMemo(() => {
-        if (!prevFrame) return null;
+        if (!prevFrame || !prevFrame.layers) return null;
         return prevFrame.layers.map(layer =>
             layer.visible && layer.paths.map(path => (
                 <Path
@@ -281,15 +305,6 @@ export const DrawingCanvas = () => {
         );
     }, [prevFrame]);
 
-    const committedPaths = React.useMemo(() => {
-        return currentFrame.layers.map((layer) => (
-            layer.visible && (
-                <React.Fragment key={layer.id}>
-                    {layer.paths.map(renderPath)}
-                </React.Fragment>
-            )
-        ));
-    }, [currentFrame, renderPath]);
 
     const activePath = React.useMemo(() => {
         if (currentPoints.length < 2) return null;
@@ -326,27 +341,44 @@ export const DrawingCanvas = () => {
                         {/* Paper background */}
                         <Rect x={0} y={0} width={canvasWidth} height={canvasHeight} color={theme.paper} />
 
-                        {/* Static Content */}
+                        {/* Onion Skin - drawn below current frame content */}
                         {onionSkin}
-                        {committedPaths}
 
-                        {/* Current Active Stroke (Brush/Eraser/Lasso boundary) */}
-                        {activePath && (
-                            <Path
-                                path={activePath}
-                                color={selectedTool === 'lasso' ? '#007AFF' : brushColor}
-                                style={selectedTool === 'bucket' ? 'fill' : 'stroke'}
-                                strokeWidth={selectedTool === 'lasso' ? 1 : brushSize}
-                                strokeCap="round"
-                                strokeJoin="round"
-                                blendMode={selectedTool === 'eraser' ? 'clear' : 'srcOver'}
-                                opacity={selectedTool === 'eraser' ? 1 : 0.8}
-                            >
-                                {selectedTool === 'lasso' && <DashPathEffect intervals={[5, 5]} />}
-                            </Path>
-                        )}
+                        {/* Layers with Isolation */}
+                        {currentFrame.layers.map((layer) => {
+                            if (!layer.visible) return null;
 
-                        {/* Persistent Lasso Selection */}
+                            const isCurrentLayer = layer.id === useDrawingStore.getState().currentLayerId;
+
+                            return (
+                                <Group
+                                    key={layer.id}
+                                    layer
+                                    opacity={layer.opacity}
+                                >
+                                    {/* Committed Paths for this Layer */}
+                                    {layer.paths.map(renderPath)}
+
+                                    {/* Active Path (Live Stroke) - Only if this is the current layer */}
+                                    {isCurrentLayer && activePath && (
+                                        <Path
+                                            path={activePath}
+                                            color={selectedTool === 'lasso' ? '#007AFF' : brushColor}
+                                            style={selectedTool === 'bucket' ? 'fill' : 'stroke'}
+                                            strokeWidth={selectedTool === 'lasso' ? 1 : brushSize}
+                                            strokeCap="round"
+                                            strokeJoin="round"
+                                            blendMode={selectedTool === 'eraser' ? 'clear' : 'srcOver'}
+                                            opacity={selectedTool === 'eraser' ? 1 : 0.8}
+                                        >
+                                            {selectedTool === 'lasso' && <DashPathEffect intervals={[5, 5]} />}
+                                        </Path>
+                                    )}
+                                </Group>
+                            );
+                        })}
+
+                        {/* Persistent Lasso Selection (Overlay) */}
                         {selectionPoints && (
                             <Path
                                 path={createSkiaPath(selectionPoints)}
@@ -362,6 +394,26 @@ export const DrawingCanvas = () => {
                     </Group>
                 </Canvas>
             </GestureDetector>
+
+            {/* Selection Context Menu */}
+            {selectedPathIds.length > 0 && (
+                <View style={[styles.selectionMenu, { backgroundColor: theme.panelBackground, borderColor: theme.border }]}>
+                    <TouchableOpacity style={styles.menuItem} onPress={deleteSelectedPaths}>
+                        <Trash2 size={20} color={theme.error || '#ff4444'} />
+                        <Text style={[styles.menuText, { color: theme.text }]}>Delete</Text>
+                    </TouchableOpacity>
+                    <View style={[styles.verticalDivider, { backgroundColor: theme.border }]} />
+                    <TouchableOpacity style={styles.menuItem} onPress={duplicateSelectedPaths}>
+                        <Copy size={20} color={theme.icon} />
+                        <Text style={[styles.menuText, { color: theme.text }]}>Copy</Text>
+                    </TouchableOpacity>
+                    <View style={[styles.verticalDivider, { backgroundColor: theme.border }]} />
+                    <TouchableOpacity style={styles.menuItem} onPress={clearSelection}>
+                        <X size={20} color={theme.text} />
+                        <Text style={[styles.menuText, { color: theme.text }]}>Close</Text>
+                    </TouchableOpacity>
+                </View>
+            )}
         </View>
     );
 };
@@ -382,5 +434,35 @@ const styles = StyleSheet.create({
     canvas: {
         flex: 1,
     },
+    selectionMenu: {
+        position: 'absolute',
+        top: 20,
+        alignSelf: 'center',
+        flexDirection: 'row',
+        alignItems: 'center',
+        padding: 8,
+        borderRadius: 12,
+        borderWidth: 1,
+        elevation: 8,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.3,
+        shadowRadius: 4.65,
+        zIndex: 100, // Ensure it's on top
+    },
+    menuItem: {
+        alignItems: 'center',
+        paddingHorizontal: 12,
+        paddingVertical: 4,
+        gap: 4,
+    },
+    menuText: {
+        fontSize: 10,
+        fontWeight: '600',
+    },
+    verticalDivider: {
+        width: 1,
+        height: '80%',
+    }
 });
 

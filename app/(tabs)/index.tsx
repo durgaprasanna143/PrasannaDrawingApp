@@ -5,9 +5,12 @@ import { LayerPanel } from '@/components/ui/panels/LayerPanel';
 import { ToolBar } from '@/components/ui/panels/ToolBar';
 import { Colors } from '@/constants/theme';
 import React from 'react';
-import { StatusBar, StyleSheet, View, useColorScheme, useWindowDimensions } from 'react-native';
-import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { ScrollView, StatusBar, StyleSheet, View, useColorScheme, useWindowDimensions } from 'react-native';
+import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
+import Animated, { runOnJS, useAnimatedStyle, useSharedValue } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
+
+const AnimatedScrollView = Animated.createAnimatedComponent(ScrollView);
 
 export default function StudioScreen() {
   const { width, height } = useWindowDimensions();
@@ -15,6 +18,27 @@ export default function StudioScreen() {
   const theme = Colors[colorScheme];
   const isLandscape = width > height;
   const isTablet = width > 768;
+
+  const sidebarWidth = useSharedValue(240);
+  const contextWidth = useSharedValue(0);
+  const [isResizing, setIsResizing] = React.useState(false);
+
+  const animatedSidebarStyle = useAnimatedStyle(() => ({
+    width: sidebarWidth.value,
+  }));
+
+  const resizeGesture = Gesture.Pan()
+    .onStart(() => {
+      runOnJS(setIsResizing)(true);
+      contextWidth.value = sidebarWidth.value;
+    })
+    .onUpdate((e) => {
+      const newWidth = contextWidth.value - e.translationX;
+      sidebarWidth.value = Math.max(50, Math.min(newWidth, 450));
+    })
+    .onEnd(() => {
+      runOnJS(setIsResizing)(false);
+    });
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
@@ -37,14 +61,51 @@ export default function StudioScreen() {
           </View>
 
           {/* Right/Bottom Panels */}
-          <View style={[
-            isLandscape ? styles.rightSidebar : styles.bottomSidebar,
-            { backgroundColor: theme.sidebar, borderColor: theme.border },
-            (!isLandscape && !isTablet) && { height: 200 }
-          ]}>
-            <ColorPanel horizontal={!isLandscape} />
-            <LayerPanel />
-          </View>
+          {isLandscape ? (
+            <>
+              <GestureDetector gesture={resizeGesture}>
+                <View style={[
+                  styles.resizeHandle,
+                  { backgroundColor: theme.background, borderColor: theme.border },
+                  isResizing && { borderColor: theme.tint }
+                ]}
+                  hitSlop={{ left: 10, right: 10 }} // Increase touch area
+                >
+                  <View style={[styles.resizeHandleGrip, { backgroundColor: theme.icon }]} />
+                </View>
+              </GestureDetector>
+
+              <Animated.View
+                style={[
+                  styles.rightSidebar,
+                  {
+                    backgroundColor: theme.sidebar,
+                    borderColor: theme.border,
+                  },
+                  animatedSidebarStyle
+                ]}
+              >
+                <ScrollView
+                  style={{ flex: 1, width: '100%' }}
+                  contentContainerStyle={{ flexGrow: 1 }}
+                  showsVerticalScrollIndicator={false}
+                >
+                  <ColorPanel horizontal={false} />
+                  <LayerPanel scrollable={false} />
+                  <View style={{ height: 40 }} />
+                </ScrollView>
+              </Animated.View>
+            </>
+          ) : (
+            <View style={[
+              styles.bottomSidebar,
+              { backgroundColor: theme.sidebar, borderColor: theme.border },
+              (!isLandscape && !isTablet) && { height: 200 }
+            ]}>
+              <ColorPanel horizontal={true} />
+              <LayerPanel />
+            </View>
+          )}
         </View>
 
         {/* Bottom Timeline */}
@@ -77,9 +138,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   rightSidebar: {
-    width: 240,
     borderLeftWidth: 1,
     borderLeftColor: '#ddd',
+    overflow: 'hidden',
+  },
+  resizeHandle: {
+    width: 14,
+    height: '100%',
+    zIndex: 100,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderLeftWidth: 1,
+    marginRight: -1, // Overlap the sidebar border seamlessly
+  },
+  resizeHandleGrip: {
+    width: 4,
+    height: 32,
+    borderRadius: 2,
+    opacity: 0.2, // Subtle but visible handle
   },
   bottomSidebar: {
     width: '100%',
@@ -89,4 +165,3 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
   },
 });
-
